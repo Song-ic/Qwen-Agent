@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""Qwen-Agent — 本地 Q6(Qwen3.6-35B-A3B-oQ6) 自定义 non-stream coding agent。
+
+cc→Qwen-Agent 协作:Claude 出规格(大脑) → Qwen-Agent 执行(手) → Claude 验收。
+工具:list_dir/read_file/grep/edit_file/write_file/run_bash;护栏:nudge 重试(空轮)
++ anti-storm(连续 14 轮只探索不动手 → stuck)。Q6 标准 tool format 不泄漏,non-stream 稳。
+
+依赖:oMLX `serve` 在 :18888 加载 Q6(OpenAI 兼容,用户自己启动 oMLX)。
+
+用法:
+  Qwen-Agent --project /path/to/proj --task "把 config.py 的 PORT 改成 9000"
+  Qwen-Agent --project . --task-file task.md --verbose
+  echo "加个 /health 端点" | Qwen-Agent --project ./svc
+"""
+import argparse
+import fnmatch
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+DEFAULT_BASE = "http://127.0.0.1:18888/v1"  # oMLX
+DEFAULT_MODEL = "Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-MLX-oQ4-MTP"  # oQ4:18GB/最快/并发余量大。实测 Q4/Q6/Q8 在 judgment 任务全翻且程度相当(金额都过度套用到 9);既都要 review,就按内存+速度选 Q4(2026-06-07)。oQ8 会 OOM 勿用;质量靠 harness(规格+机器判据+高风险 review)不靠模型
+ROOT = os.getcwd()  # overwritten in main()
+ALLOW = None  # 写白名单(防越界):None=不限制;list=只允许 edit/write 这些相对路径/glob,其余拒绝
+
+SYSTEM_PROMPT = """You are a precise, autonomous coding agent working inside a real software project.
+You complete coding tasks end-to-end: explore the code, reason about the change, apply edits with tools, and verify the result.
+
+# Tools
+- list_dir(path): list files/dirs at a relative path ('.' = project root).
+- read_file(path): read a file's full text. ALWAYS read a file before editing it.
+- grep(pattern, path): search a regex across files. path '.' = whole project, or pass a subdir/file. Returns file:line:text. Use this to LOCATE code fast instead of reading large files blindly.
+- edit_file(path, old_string, new_string): replace an EXACT, unique occurrence of old_string. It must match byte-for-byte including indentation.
+- write_file(path, content): create a new file or fully overwrite one. Use only for new files or full rewrites.
+- run_bash(command): run a shell command from the project root (build, tests, import checks).
+
+# Procedure (follow strictly)
+1. EXPLORE with list_dir/grep/read_file until you know exactly what to change. Use grep to locate symbols/strings fast; read_file only the regions you need (do NOT re-read the same large file many times). Never edit a file you have not read this session.
+2. PLAN the precise files/lines and order in your reasoning, so imports/build stay valid.
+3. APPLY surgical edits. Change only what the task requires. Preserve existing style and indentation.
+4. VERIFY after every change by re-reading the region or running a command (import check / test / build).
+5. FINISH: once the task is fully complete AND verified, reply with a short plain-text summary and DO NOT call any more tools. The absence of tool calls signals completion.
+
+# Hard rules
+- Be decisive and autonomous; never ask the user questions — make the reasonable choice and proceed.
+- Minimal, surgical changes; do not refactor or reformat unrelated code.
+- For a LARGE change, make SEVERAL small edits step-by-step (one method/block per edit_file call) instead of one giant rewrite — oversized single edits trigger early-stop on this model.
+- Keep imports/build valid after changes. For multi-file tasks, finish ALL files before stopping.
+- If edit_file fails (old_string not found or not unique), re-read the file and retry with a longer exact string. Do not guess.
+- Do not invent files or paths — verify with list_dir/read_file.
+- Every change must trace directly to the task. After verification passes, stop calling tools and give the summary.
+
+# Reasoning
+Think briefly before each tool call: what you know, what's still needed, the next single action. Don't pad; keep moving toward completion.
+
+# Environment notes
+- Your FIRST action MUST be a tool call (start by exploring with list_dir or read_file). Do NOT end your turn before calling at least one tool.
+- Put tool calls in the proper tool-call channel, never inside your reasoning text.
+- Use `python3` (not `python`) to run code/tests; `python` and `pytest` may not be on PATH. Prefer `python3 -m unittest` or `python3 -m pytest`.
+"""
+
+TOOLS = [
+    {"type": "function", "function": {
+        "name": "list_dir",
+        "description": "List files and directories at a relative path within the project. Use '.' for the project root.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
+    {"type": "function", "function": {
+        "name": "read_file",
+        "description": "Read the full text content of a file at a relative path.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
+    {"type": "function", "function": {
+        "name": "grep",
+        "description": "Search a regex pattern across files. path '.' = whole project, or a subdir/file. Returns file:line:text matches. Use to locate code without reading whole files.",
+        "parameters": {"type": "object", "properties": {
+            "pattern": {"type": "string"}, "path": {"type": "string"}}, "required": ["pattern"]}}},
+    {"type": "function", "function": {
+        "name": "edit_file",
+        "description": "Replace an exact, unique occurrence of old_string with new_string. old_string must match byte-for-byte including indentation.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"}, "old_string": {"type": "string"}, "new_string": {"type": "string"}},
+            "required": ["path", "old_string", "new_string"]}}},
+    {"type": "function", "function": {
+        "name": "write_file",
+        "description": "Create a new file or fully overwrite an existing file with the given content.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}},
+    {"type": "function", "function": {
+        "name": "run_bash",
+        "description": "Run a shell command from the project root and return combined stdout/stderr.",
+        "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
+]
+
+
+def _safe(path: str) -> str:
+    full = os.path.realpath(os.path.join(ROOT, path))
+    if not (full == os.path.realpath(ROOT) or full.startswith(os.path.realpath(ROOT) + os.sep)):
+        raise ValueError(f"path escapes project root: {path}")
+    return full
+
+
+def _denied(path: str):
+    """写白名单守卫:ALLOW 激活时,范围外的 edit/write 返回拒绝消息(防越界);否则返回 None。"""
+    if ALLOW is None:
+        return None
+    rel = os.path.relpath(os.path.realpath(os.path.join(ROOT, path)), os.path.realpath(ROOT))
+    for pat in ALLOW:
+        if rel == pat or fnmatch.fnmatch(rel, pat):
+            return None
+    return (f"REFUSED: '{rel}' 在允许范围外。只能创建/修改:{', '.join(ALLOW)}。"
+            "禁止新建或编辑范围外的任何文件 —— 严格留在范围内。")
+
+
+def _edit_hint(text: str, old: str) -> str:
+    """edit_file old_string 未命中时,给最接近的现有内容帮模型重试(ACI:工具反馈 > 模型能力)。"""
+    old_lines = [l for l in old.splitlines() if l.strip()]
+    if not old_lines:
+        return ""
+    first = old_lines[0].strip()
+    toks = [t for t in first.replace("(", " ").replace(")", " ").replace(".", " ").split() if len(t) >= 4]
+    probe = max(toks, key=len) if toks else first[:24]
+    file_lines = text.splitlines()
+    hits = [i for i, l in enumerate(file_lines) if probe and probe in l]
+    if not hits:
+        return f" 文件里没有 '{probe}' —— 确认路径对,或先 read_file 看实际内容。"
+    blocks = []
+    for i in hits[:3]:
+        lo, hi = max(0, i - 2), min(len(file_lines), i + 3)
+        blocks.append("\n".join(f"{n+1}: {file_lines[n]}" for n in range(lo, hi)))
+    return (" 最接近的现有内容(带行号,照它逐字重写 old_string):\n"
+            + "\n  ---\n".join(blocks))
+
+
+def exec_tool(name: str, args: dict) -> str:
+    try:
+        if name == "list_dir":
+            full = _safe(args.get("path", "."))
+            if not os.path.isdir(full):
+                return f"ERROR: not a directory: {args.get('path')}"
+            entries = sorted(os.listdir(full))
+            return "\n".join(entries) if entries else "(empty)"
+        if name == "read_file":
+            full = _safe(args["path"])
+            if not os.path.isfile(full):
+                return f"ERROR: file not found: {args['path']}"
+            with open(full, encoding="utf-8") as f:
+                return f.read()
+        if name == "grep":
+            pattern = args["pattern"]
+            full = _safe(args.get("path", "."))
+            rg = shutil.which("rg")
+            if rg:
+                cmd = [rg, "-n", "--max-count=40", "--no-heading", "-e", pattern, full]
+            else:
+                cmd = ["grep", "-rn", "--max-count=40", "-e", pattern, full]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+            out = (r.stdout or r.stderr).strip()
+            if not out:
+                return "(no matches)"
+            base = os.path.realpath(ROOT) + os.sep
+            lines = [ln.replace(base, "") for ln in out.splitlines()]
+            extra = f"\n... ({len(lines) - 60} more matches, refine pattern)" if len(lines) > 60 else ""
+            return "\n".join(lines[:60]) + extra
+        if name == "edit_file":
+            deny = _denied(args["path"])
+            if deny:
+                return deny
+            full = _safe(args["path"])
+            if not os.path.isfile(full):
+                return f"ERROR: file not found: {args['path']}"
+            with open(full, encoding="utf-8") as f:
+                text = f.read()
+            old, new = args["old_string"], args["new_string"]
+            cnt = text.count(old)
+            if cnt == 0:
+                return "ERROR: old_string 未命中(需逐字匹配,含缩进)。" + _edit_hint(text, old)
+            if cnt > 1:
+                return f"ERROR: old_string not unique ({cnt} matches). Add surrounding context."
+            with open(full, "w", encoding="utf-8") as f:
+                f.write(text.replace(old, new, 1))
+            return f"OK: edited {args['path']}"
+        if name == "write_file":
+            deny = _denied(args["path"])
+            if deny:
+                return deny
+            full = _safe(args["path"])
+            os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
+            with open(full, "w", encoding="utf-8") as f:
+                f.write(args["content"])
+            return f"OK: wrote {args['path']}"
+        if name == "run_bash":
+            r = subprocess.run(args["command"], shell=True, cwd=ROOT,
+                               capture_output=True, text=True, timeout=60)
+            out = (r.stdout + r.stderr).strip()
+            return out[:3000] if out else f"(exit {r.returncode}, no output)"
+        return (f"ERROR: unknown tool '{name}'. Available tools: "
+                "list_dir, read_file, grep, edit_file, write_file, run_bash.")
+    except KeyError as e:
+        return f"ERROR: missing argument {e}"
+    except Exception as e:  # noqa: BLE001
+        return f"ERROR: {type(e).__name__}: {e}"
+
+
+def chat(messages, base, model, temperature, reasoning_effort, timeout, max_tokens):
+    payload = {"model": model, "messages": messages, "tools": TOOLS,
+               "tool_choice": "auto", "stream": False,
+               "temperature": temperature, "max_tokens": max_tokens}
+    if reasoning_effort:
+        payload["reasoning_effort"] = reasoning_effort
+    req = urllib.request.Request(f"{base}/chat/completions",
+                                 data=json.dumps(payload).encode("utf-8"),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+
+def run_agent(task, base, model, temperature, reasoning_effort,
+              max_nudge, max_turns, timeout, max_tokens, verbose):
+    messages = [{"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": task}]
+    nudges = 0
+    no_progress = 0  # 连续无 edit/write 的轮数(anti-storm:防 grep/read 风暴空转到 max_turns)
+    for turn in range(1, max_turns + 1):
+        try:
+            resp = chat(messages, base, model, temperature, reasoning_effort, timeout, max_tokens)
+        except urllib.error.HTTPError as e:
+            return {"status": "http_error", "detail": f"{e.code} {e.read()[:300]}", "turns": turn}
+        except Exception as e:  # noqa: BLE001
+            return {"status": "exception", "detail": f"{type(e).__name__}: {e}", "turns": turn}
+
+        choice = resp.get("choices", [{}])[0]
+        msg = choice.get("message", {}) or {}
+        reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
+        content = msg.get("content") or ""
+        tcs = msg.get("tool_calls") or []
+        finish = choice.get("finish_reason")
+
+        names = [tc.get("function", {}).get("name") for tc in tcs]
+        print(f"  turn {turn:2d}: finish={finish:<11} reasoning={len(reasoning):5d}c "
+              f"tools={names} content={len(content)}c", flush=True)
+        if verbose and reasoning:
+            print(f"    reasoning: {reasoning[:400]}", flush=True)
+
+        if tcs:
+            messages.append({"role": "assistant", "content": content or None, "tool_calls": tcs})
+            for tc in tcs:
+                fn = tc.get("function", {})
+                raw = fn.get("arguments", "{}")
+                try:
+                    targs = json.loads(raw) if isinstance(raw, str) else (raw or {})
+                except json.JSONDecodeError:
+                    result = f"ERROR: arguments not valid JSON: {raw[:200]}"
+                else:
+                    result = exec_tool(fn.get("name", ""), targs)
+                if verbose:
+                    print(f"    {fn.get('name')}({str(targs)[:80]}) -> {result[:120]}", flush=True)
+                messages.append({"role": "tool", "tool_call_id": tc.get("id", ""), "content": result})
+            # anti-storm: 连续多轮只探索(grep/read/list)不动手(edit/write) → 模型卡住,早止损
+            if any(tc.get("function", {}).get("name") in ("edit_file", "write_file") for tc in tcs):
+                no_progress = 0
+            else:
+                no_progress += 1
+                if no_progress >= 14:
+                    return {"status": "stuck",
+                            "detail": (f"连续 {no_progress} 轮只探索(grep/read)未做任何 edit/write — "
+                                       "模型卡住(不会写或定位绕圈)。对策:拆更小片,或规格直接给精确 "
+                                       "old_string→new_string 让它照填。"),
+                            "turns": turn}
+            continue
+
+        stripped = content.strip()
+        # 排除 harmony tool-call 泄漏文本被误判为 final(parser 偶尔把不完整 tool call
+        # 漏成 content,如 "to=functions.run_bash?")。漏判会丢工具调用 → 当 early_stop 处理。
+        is_leak = "to=functions." in stripped or stripped.startswith(("commentary", "analysis"))
+        if stripped and not is_leak:
+            return {"status": "done", "detail": stripped, "turns": turn}
+
+        # early_stop(空)或泄漏文本 → nudge-retry(gpt-oss long-reasoning EOS / channel 转换 quirk)
+        if nudges < max_nudge:
+            nudges += 1
+            messages.append({"role": "user", "content":
+                "You ended your turn without calling a tool or giving a final text answer. "
+                "If the task is NOT yet complete, call the next required tool now. "
+                "If it IS complete and verified, reply with your final summary."})
+            print(f"    [nudge {nudges}/{max_nudge}] early_stop at turn {turn} "
+                  f"(reasoning={len(reasoning)}c), retrying", flush=True)
+            continue
+        return {"status": "early_stop", "detail": f"stalled after {nudges} nudges", "turns": turn}
+
+    return {"status": "max_turns", "detail": f"hit {max_turns} turns", "turns": max_turns}
+
+
+def main():
+    global ROOT, ALLOW
+    ap = argparse.ArgumentParser(description="Qwen-Agent: local Q6 non-stream coding agent")
+    ap.add_argument("--project", default=".", help="project root the agent operates in")
+    ap.add_argument("--task", help="the coding task (or use --task-file / stdin)")
+    ap.add_argument("--task-file", help="read task from a file")
+    ap.add_argument("--base", default=DEFAULT_BASE)
+    ap.add_argument("--model", default=DEFAULT_MODEL)
+    ap.add_argument("--allow", default=None,
+                    help="逗号分隔的相对路径/glob 白名单:只允许 edit/write 这些文件,其余拒绝(防越界)。省略=不限制")
+    ap.add_argument("--temp", type=float, default=0.0)
+    ap.add_argument("--reasoning-effort", dest="reasoning_effort", default=None,
+                    choices=["low", "medium", "high"])
+    ap.add_argument("--max-nudge", type=int, default=5)  # 5: 超复杂任务(大段重写)early_stop 概率高,2 不够(W2 实测)
+    ap.add_argument("--max-turns", type=int, default=24)  # 健康成功任务实测 turn max=20(RxI);24=20+余量。空转靠 anti-storm(14轮无edit)提前抓,max_turns 只兜底"有进展但量大"
+    ap.add_argument("--timeout", type=int, default=300)
+    ap.add_argument("--max-tokens", type=int, default=8192)
+    ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--verify", default=None,
+                    help="跑完(status=done)自动执行的验证命令(compile/test/grep 断言);exit≠0 → 整体判 verify_failed(exit 1)")
+    ap.add_argument("--max-diff-lines", dest="max_diff_lines", type=int, default=None,
+                    help="跑完检查 git diff 改动总行数,超此值告警(--allow 挡不住的文件内逻辑越界 tripwire)")
+    ap.add_argument("--verify-retries", dest="verify_retries", type=int, default=2,
+                    help="--verify FAIL 时把错误喂回 Q4 自纠错的最大重试次数(默认 2;0=只验不修)")
+    args = ap.parse_args()
+
+    if args.task:
+        task = args.task
+    elif args.task_file:
+        with open(args.task_file, encoding="utf-8") as f:
+            task = f.read()
+    elif not sys.stdin.isatty():
+        task = sys.stdin.read()
+    else:
+        ap.error("no task: use --task, --task-file, or pipe via stdin")
+
+    ROOT = os.path.realpath(args.project)
+    if not os.path.isdir(ROOT):
+        ap.error(f"project dir not found: {ROOT}")
+
+    if args.allow:
+        ALLOW = [(p.strip()[2:] if p.strip().startswith("./") else p.strip())
+                 for p in args.allow.split(",") if p.strip()]
+        task += ("\n\n[SCOPE 白名单] 你只能创建/修改这些文件:" + ", ".join(ALLOW)
+                 + "。任何范围外的 edit/write 会被工具拒绝 —— 别浪费轮次,严格留在范围内。")
+        print(f"[Qwen-Agent] 写白名单生效(防越界): {ALLOW}")
+
+    # preflight
+    try:
+        with urllib.request.urlopen(f"{args.base}/models", timeout=10) as r:
+            ids = [m.get("id") for m in json.loads(r.read()).get("data", [])]
+        print(f"[Qwen-Agent] server={args.base} models={ids} project={ROOT}")
+    except Exception as e:  # noqa: BLE001
+        print(f"[Qwen-Agent] SERVER NOT REACHABLE at {args.base}: {e}")
+        sys.exit(3)
+
+    print(f"[Qwen-Agent] task: {task.strip()[:200]}\n")
+    t0 = time.time()
+    out = run_agent(task, args.base, args.model, args.temp, args.reasoning_effort,
+                    args.max_nudge, args.max_turns, args.timeout, args.max_tokens, args.verbose)
+    dt = time.time() - t0
+    print(f"\n[Qwen-Agent] status={out['status']} turns={out['turns']} {dt:.1f}s")
+    print("=" * 60)
+    print(out["detail"])
+
+    # ① 自动验证 + 自纠错循环(Aider 式):FAIL → 把错误喂回 Q4 修 → 重验,最多 verify_retries 次
+    if args.verify and out["status"] == "done":
+        for attempt in range(args.verify_retries + 1):
+            print(f"\n[Qwen-Agent] 自动验证 (第 {attempt + 1}/{args.verify_retries + 1} 次): {args.verify}")
+            try:
+                vr = subprocess.run(args.verify, shell=True, cwd=ROOT,
+                                    capture_output=True, text=True, timeout=600)
+            except Exception as e:  # noqa: BLE001
+                print(f"[Qwen-Agent] 验证命令异常: {type(e).__name__}: {e}")
+                out["status"] = "verify_failed"
+                break
+            if vr.returncode == 0:
+                print("[Qwen-Agent] 验证 PASS ✓")
+                break
+            verr = (vr.stdout + vr.stderr).strip()
+            print(f"[Qwen-Agent] 验证 FAIL ✗ (exit {vr.returncode})")
+            print(verr[-1500:])
+            if attempt >= args.verify_retries:
+                out["status"] = "verify_failed"
+                break
+            # 自纠错:把验证错误喂回 Q4,让它定位修复
+            print(f"[Qwen-Agent] 🔧 自纠错 retry {attempt + 1}/{args.verify_retries}:把错误喂回 Q4...")
+            fix_task = (f"你上一次的改动没通过验证命令 `{args.verify}`。\n\n验证错误输出:\n"
+                        f"{verr[-2500:]}\n\n请定位并修复导致验证失败的根因,只改必要处,"
+                        "别引入新东西、别动无关代码。"
+                        + (f"\n\n[SCOPE 白名单] 只能改:{', '.join(ALLOW)}" if ALLOW else ""))
+            fix_out = run_agent(fix_task, args.base, args.model, args.temp, args.reasoning_effort,
+                                args.max_nudge, args.max_turns, args.timeout, args.max_tokens, args.verbose)
+            print(f"[Qwen-Agent] 自纠错 dispatch status={fix_out['status']}")
+            if fix_out["status"] != "done":
+                print("[Qwen-Agent] 自纠错未正常完成,停止重试")
+                out["status"] = "verify_failed"
+                break
+
+    # ② diff 规模 tripwire:改动总行数超阈值告警(抓文件内逻辑越界/过度改,--allow 挡不住的)
+    if args.max_diff_lines is not None and args.max_diff_lines >= 0:
+        try:
+            ns = subprocess.run(["git", "-C", ROOT, "diff", "--numstat"],
+                                capture_output=True, text=True, timeout=20)
+            total = 0
+            for ln in ns.stdout.splitlines():
+                cols = ln.split("\t")
+                if len(cols) >= 2:
+                    total += (int(cols[0]) if cols[0].isdigit() else 0)
+                    total += (int(cols[1]) if cols[1].isdigit() else 0)
+            if total > args.max_diff_lines:
+                print(f"\n[Qwen-Agent] ⚠️ DIFF 超预期: {total} 行 > 阈值 {args.max_diff_lines} "
+                      "—— 可能文件内逻辑越界/过度改,建议 Claude review")
+            else:
+                print(f"[Qwen-Agent] diff 规模 {total} 行 (≤ {args.max_diff_lines}) ✓")
+        except Exception as e:  # noqa: BLE001
+            print(f"[Qwen-Agent] diff 检查跳过: {e}")
+
+    sys.exit(0 if out["status"] == "done" else 1)
+
+
+if __name__ == "__main__":
+    main()
