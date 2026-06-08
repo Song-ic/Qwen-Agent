@@ -1,5 +1,7 @@
 # Qwen-Agent
 
+[English](README.en.md) · **中文**
+
 > 把强模型当**大脑**、本地模型当**手**的极简编码 agent。
 > Claude 出规格 → 本地模型落地 → Claude 验收。
 > 一个 **~420 行单文件 Python,零三方依赖**。
