@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""qwen-agent-mcp — MCP stdio server wrapping Qwen-Agent CLI.
+
+Lets Claude Code and Codex dispatch coding tasks to the local Qwen-Agent
+(Q6 via oMLX) through a standard MCP tool interface.
+
+Zero external dependencies. Single file. Same philosophy as Qwen-Agent.
+
+Install:
+  cp qwen-agent-mcp ~/.local/bin/ && chmod +x ~/.local/bin/qwen-agent-mcp
+
+Claude Code (~/.claude.json → mcpServers):
+  "qwen-agent": {"command": "qwen-agent-mcp"}
+
+Codex (config.toml → [mcp_servers.qwen-agent]):
+  command = "qwen-agent-mcp"
+
+Test:
+  echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}}' | qwen-agent-mcp
+"""
+import json
+import os
+import signal
+import subprocess
+import sys
+import urllib.request
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+QWEN_AGENT_BIN = os.path.expanduser("~/.local/bin/Qwen-Agent")
+DEFAULT_BASE = "http://127.0.0.1:18888/v1"
+DISPATCH_TIMEOUT = 600  # 10 min
+
+# ---------------------------------------------------------------------------
+# Server instructions — injected into client system prompt (Claude & Codex)
+# ---------------------------------------------------------------------------
+INSTRUCTIONS = """\
+# Qwen-Agent — Local Coding Agent
+
+You have access to a **local coding agent** (Qwen-Agent) running a free local LLM \
+(Qwen 3.6 35B via oMLX on Apple Silicon, ~113 tok/s). \
+Use it to offload mechanical coding tasks — saves API tokens, results stay local.
+
+## Three-tier dispatch routing
+
+### Tier 1 — You do it directly (DON'T call Qwen-Agent)
+- Trivial: single value, typo, constant — describing it is longer than doing it.
+
+### Tier 2 — dispatch_task (one-liner, no spec file)
+ALL must be true: root cause clear, single file, <30 lines, not high-risk, \
+no precise value constraints.
+
+### Tier 3 — dispatch_spec (spec file → dispatch)
+ANY triggers it: multi-file, needs judgment, precise values, high-risk, \
+>30 lines, new feature, or previous dispatch_task failed.
+
+## Protocol
+1. Call **check_backend()** first to verify the local LLM is online.
+2. Tier 2: call **dispatch_task** with a clear one-liner.
+3. Tier 3: write a spec .md file, then call **dispatch_spec**.
+4. After dispatch: **NEVER trust self-report**. Verify independently \
+(git diff / compile / test / grep).
+5. Failure: fix spec and retry, or fall back to Tier 1.
+
+## Key parameters
+- **allow**: comma-separated paths/globs — restricts editable files (prevents scope creep).
+- **verify**: shell command run post-completion — exit 0 = pass, else auto-retry.
+- **max_diff_lines**: warn if changed lines exceed threshold (catches over-editing).
+"""
+
+# ---------------------------------------------------------------------------
+# Tool definitions
+# ---------------------------------------------------------------------------
+TOOLS = [
+    {
+        "name": "dispatch_task",
+        "description": (
+            "Dispatch a coding task to the local Qwen-Agent as a one-liner. "
+            "For Tier 2: clear target, single file, <30 lines, non-high-risk. "
+            "Returns status (done/stuck/early_stop/max_turns) and exit code "
+            "(0=success, 1=fail, 3=backend down)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "Absolute path to the project root directory.",
+                },
+                "task": {
+                    "type": "string",
+                    "description": (
+                        "Task description. Include: what to change, where "
+                        "(file/method/class anchor), and key constraints."
+                    ),
+                },
+                "allow": {
+                    "type": "string",
+                    "description": "Comma-separated relative paths/globs of editable files. Omit = no restriction.",
+                },
+                "verify": {
+                    "type": "string",
+                    "description": "Verification command (e.g. 'mvn -q compile'). Exit 0 = pass.",
+                },
+                "max_diff_lines": {
+                    "type": "integer",
+                    "description": "Warn if total diff lines exceed this.",
+                },
+            },
+            "required": ["project", "task"],
+        },
+    },
+    {
+        "name": "dispatch_spec",
+        "description": (
+            "Dispatch a coding task from a spec file to the local Qwen-Agent. "
+            "For Tier 3: multi-file, judgment, precise values, high-risk, or >30 lines. "
+            "Write the spec .md file first, then call this tool."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "Absolute path to the project root directory.",
+                },
+                "spec_file": {
+                    "type": "string",
+                    "description": "Spec file path (absolute, or relative to project root).",
+                },
+                "allow": {
+                    "type": "string",
+                    "description": "Comma-separated relative paths/globs of editable files.",
+                },
+                "verify": {
+                    "type": "string",
+                    "description": "Verification command. Exit 0 = pass.",
+                },
+                "max_diff_lines": {
+                    "type": "integer",
+                    "description": "Warn if total diff lines exceed this.",
+                },
+                "verify_retries": {
+                    "type": "integer",
+                    "description": "Auto-fix retries on verify fail (default 2; 0 = verify only).",
+                },
+            },
+            "required": ["project", "spec_file"],
+        },
+    },
+    {
+        "name": "check_backend",
+        "description": (
+            "Check if the local LLM backend (oMLX) is online and which model is loaded. "
+            "Call before dispatching."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "base_url": {
+                    "type": "string",
+                    "description": f"oMLX base URL (default: {DEFAULT_BASE}).",
+                },
+            },
+        },
+    },
+]
+
+# ---------------------------------------------------------------------------
+# Tool implementations
+# ---------------------------------------------------------------------------
+
+def _ok(text):
+    return {"content": [{"type": "text", "text": text}], "isError": False}
+
+def _err(text):
+    return {"content": [{"type": "text", "text": text}], "isError": True}
+
+def _log(msg):
+    print(f"[qwen-agent-mcp] {msg}", file=sys.stderr, flush=True)
+
+def _run_agent(cmd):
+    _log(f"exec: {' '.join(cmd[:6])}...")
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=DISPATCH_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return _err(f"Qwen-Agent timed out ({DISPATCH_TIMEOUT}s)")
+    except FileNotFoundError:
+        return _err(f"Qwen-Agent binary not found: {QWEN_AGENT_BIN}")
+    except Exception as e:
+        return _err(f"Execution error: {type(e).__name__}: {e}")
+
+    out = proc.stdout
+    if len(out) > 4000:
+        out = f"...(truncated {len(proc.stdout) - 4000} chars)...\n" + out[-4000:]
+    text = f"exit_code: {proc.returncode}\n\n{out}"
+    if proc.stderr:
+        text += f"\nstderr (last 500):\n{proc.stderr[-500:]}"
+    return {"content": [{"type": "text", "text": text}], "isError": proc.returncode != 0}
+
+
+def do_dispatch_task(args):
+    project = args.get("project", "")
+    task = args.get("task", "")
+    if not project or not os.path.isdir(project):
+        return _err(f"Project directory not found: {project}")
+    if not task.strip():
+        return _err("Task description is empty.")
+
+    cmd = [QWEN_AGENT_BIN, "--project", project, "--task", task]
+    if args.get("allow"):
+        cmd += ["--allow", args["allow"]]
+    if args.get("verify"):
+        cmd += ["--verify", args["verify"]]
+    if args.get("max_diff_lines") is not None:
+        cmd += ["--max-diff-lines", str(args["max_diff_lines"])]
+    return _run_agent(cmd)
+
+
+def do_dispatch_spec(args):
+    project = args.get("project", "")
+    spec = args.get("spec_file", "")
+    if not project or not os.path.isdir(project):
+        return _err(f"Project directory not found: {project}")
+    if not os.path.isabs(spec):
+        spec = os.path.join(project, spec)
+    if not os.path.isfile(spec):
+        return _err(f"Spec file not found: {spec}")
+
+    cmd = [QWEN_AGENT_BIN, "--project", project, "--task-file", spec]
+    if args.get("allow"):
+        cmd += ["--allow", args["allow"]]
+    if args.get("verify"):
+        cmd += ["--verify", args["verify"]]
+    if args.get("max_diff_lines") is not None:
+        cmd += ["--max-diff-lines", str(args["max_diff_lines"])]
+    if args.get("verify_retries") is not None:
+        cmd += ["--verify-retries", str(args["verify_retries"])]
+    return _run_agent(cmd)
+
+
+def do_check_backend(args):
+    base = args.get("base_url") or DEFAULT_BASE
+    try:
+        req = urllib.request.Request(f"{base}/models", method="GET")
+        with urllib.request.urlopen(req, timeout=10) as r:
+            models = [m.get("id", "?") for m in json.loads(r.read()).get("data", [])]
+        return _ok(f"Backend online: {base}\nModels: {', '.join(models)}")
+    except Exception as e:
+        return _err(f"Backend NOT reachable ({base}): {e}")
+
+
+TOOL_DISPATCH = {
+    "dispatch_task": do_dispatch_task,
+    "dispatch_spec": do_dispatch_spec,
+    "check_backend": do_check_backend,
+}
+
+# ---------------------------------------------------------------------------
+# MCP stdio transport (auto-detect Content-Length / newline framing)
+# ---------------------------------------------------------------------------
+_stdin = sys.stdin.buffer
+_stdout = sys.stdout.buffer
+
+
+def _read_message():
+    line = _stdin.readline()
+    if not line:
+        return None
+    line = line.strip()
+    if not line:
+        return _read_message()
+
+    if line.startswith(b"Content-Length:"):
+        length = int(line.split(b":")[1].strip())
+        while _stdin.readline().strip():
+            pass
+        data = b""
+        while len(data) < length:
+            chunk = _stdin.read(length - len(data))
+            if not chunk:
+                break
+            data += chunk
+        return json.loads(data)
+    return json.loads(line)
+
+
+def _write_message(msg):
+    data = json.dumps(msg, ensure_ascii=False).encode("utf-8")
+    _stdout.write(f"Content-Length: {len(data)}\r\n\r\n".encode("utf-8"))
+    _stdout.write(data)
+    _stdout.flush()
+
+
+# ---------------------------------------------------------------------------
+# JSON-RPC handler
+# ---------------------------------------------------------------------------
+
+def _handle(msg):
+    method = msg.get("method")
+    msg_id = msg.get("id")
+
+    if msg_id is None:
+        return None
+
+    if method == "initialize":
+        result = {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "qwen-agent", "version": "1.0.0"},
+            "instructions": INSTRUCTIONS,
+        }
+    elif method == "tools/list":
+        result = {"tools": TOOLS}
+    elif method == "tools/call":
+        params = msg.get("params", {})
+        name = params.get("name", "")
+        arguments = params.get("arguments", {})
+        handler = TOOL_DISPATCH.get(name)
+        if handler:
+            try:
+                result = handler(arguments)
+            except Exception as e:
+                result = _err(f"Internal error in {name}: {type(e).__name__}: {e}")
+        else:
+            result = _err(f"Unknown tool: {name}")
+    elif method == "ping":
+        result = {}
+    else:
+        return {
+            "jsonrpc": "2.0", "id": msg_id,
+            "error": {"code": -32601, "message": f"Method not found: {method}"},
+        }
+    return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+    _log("started")
+    try:
+        while True:
+            msg = _read_message()
+            if msg is None:
+                break
+            resp = _handle(msg)
+            if resp is not None:
+                _write_message(resp)
+    except (BrokenPipeError, IOError):
+        pass
+    _log("stopped")
+
+
+if __name__ == "__main__":
+    main()
