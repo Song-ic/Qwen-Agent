@@ -74,7 +74,9 @@
 
 ---
 
-## 3. 六个工具:`exec_tool`
+## 3. 工具:`exec_tool`
+
+### 3.1 六个基础工具(始终可用)
 
 | 工具 | 作用 | 关键设计 |
 |---|---|---|
@@ -85,9 +87,22 @@
 | `write_file(path, content)` | 新建/全覆盖 | 仅用于新文件或整体重写 |
 | `run_bash(command)` | 跑命令 | `cwd=项目根`;60s 超时;输出截断 3000 字符 |
 
+### 3.2 codegraph 智能定位工具(自动启用)
+
+`main()` 启动时检测 `{project}/.codegraph/codegraph.db` 是否存在。有 → 自动追加两个工具到 `TOOLS` 列表 + system prompt 追加使用引导;无 → 透明降级,不影响基础工具。
+
+| 工具 | 作用 | 关键设计 |
+|---|---|---|
+| `search_symbol(query, kind?)` | 按名字查符号(class/method/function/field 等) | 直接查 SQLite FTS 索引,sub-ms;精确匹配优先排序;比 grep 噪声少一个数量级 |
+| `find_references(symbol, direction?)` | 查调用关系(callers/callees/both) | 查 edges 表连 nodes,返回调用者/被调用者的 kind + file:line;理解修改影响面 |
+
+实现:**直接 `sqlite3` 查 `.codegraph/codegraph.db`**,零额外依赖(不走 MCP,不起额外进程)。codegraph 的索引由 codegraph MCP server 的 file watcher 维护,Qwen-Agent 只读。
+
+> **为什么内置而非走 MCP?** codegraph MCP 是 Claude Code 的插件(大脑侧),Qwen-Agent 是独立 Python 脚本(手侧)。走 MCP 需要跑 client + server 进程,复杂度上升;直接查 SQLite 零成本、零依赖,且查询结果格式简洁(不像 MCP 返回富文本),更适合本地中小模型消化。
+
 所有路径都过 `_safe()`:`realpath` 归一后必须在 `--project` 根内,否则抛错。这是**始终开启的沙箱**,与白名单无关。
 
-> 为什么只有 6 个、且故意"小"?因为工具越多、输出越大,本地中小模型越容易迷失。每个工具的输出都有意截断(grep 60 行 / bash 3000 字符),逼模型"精确定位"而非"大水漫灌"。
+> 为什么基础工具只有 6 个、且故意"小"?因为工具越多、输出越大,本地中小模型越容易迷失。每个工具的输出都有意截断(grep 60 行 / bash 3000 字符),逼模型"精确定位"而非"大水漫灌"。codegraph 工具是例外——它天然返回结构化精简结果(符号名 + file:line),不会淹没 context。
 
 ---
 
@@ -166,7 +181,7 @@ ACI(Agent–Computer Interface)的信条:**与其指望模型更聪明,不如让
 | `timeout` | `300s` | 给 MoE 大模型单次生成留足 |
 | grep 截断 | 60 行 / max-count 40 | 逼精确定位,省 context |
 | bash 截断 | 3000 字符 | 同上 |
-| 工具数 | **6** | 够用即止,工具越多笨手越迷失 |
+| 基础工具数 | **6**(+ codegraph 项目自动 +2） | 够用即止,工具越多笨手越迷失;codegraph 工具返回结构化精简结果,不增加迷失风险 |
 
 ---
 
@@ -175,7 +190,7 @@ ACI(Agent–Computer Interface)的信条:**与其指望模型更聪明,不如让
 ```
 task(规格)
   └─▶ messages[system + user]
-        └─▶ chat() ⇄ 本地后端 (tools=6, tool_choice=auto, non-stream)
+        └─▶ chat() ⇄ 本地后端 (tools=6+codegraph, tool_choice=auto, non-stream)
               └─▶ tool_calls ─▶ exec_tool (沙箱+白名单) ─▶ tool result ─▶ 回填 messages
                     └─▶ (循环, 带 anti-storm / nudge)
                           └─▶ done ─▶ [--verify 自纠错] ─▶ [--max-diff-lines 告警] ─▶ exit code

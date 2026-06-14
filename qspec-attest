@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# qspec-attest — SHA-256 lock for Qwen-Agent specs (.qwen-tasks/)
+#
+# Enforces CLAUDE.md 铁律 3 ("沉默偏离 = 严重违规") by turning silent spec edits
+# into a hard, visible failure: lock the SHA after authoring, verify before
+# dispatch, clear explicitly when you want to revise.
+#
+# usage:
+#   qspec-attest lock   <spec>      Record current SHA-256
+#   qspec-attest verify <spec>      Compare current vs locked (exit 2 on tamper)
+#   qspec-attest clear  <spec>      Remove the lock (explicit revision)
+#   qspec-attest list               Show all current locks
+#
+# Lock file: $QSPEC_ATT_FILE or .qwen-tasks/.attestation (relative to PWD)
+
+set -e
+ATT_FILE="${QSPEC_ATT_FILE:-.qwen-tasks/.attestation}"
+ACTION="${1:-}"
+SPEC="${2:-}"
+
+usage() {
+  cat <<'EOF'
+qspec-attest — SHA-256 lock for Qwen-Agent specs
+
+  qspec-attest lock   <spec>      Record current SHA-256
+  qspec-attest verify <spec>      Compare current vs locked (exit 2 on tamper)
+  qspec-attest clear  <spec>      Remove the lock (explicit revision)
+  qspec-attest list               Show all current locks
+
+Lock file: $QSPEC_ATT_FILE or .qwen-tasks/.attestation (relative to PWD)
+EOF
+}
+
+sha_of() { /usr/bin/shasum -a 256 "$1" | awk '{print $1}'; }
+
+require_spec() {
+  [ -n "$SPEC" ] || { echo "error: missing <spec>" >&2; usage >&2; exit 1; }
+  [ -f "$SPEC" ] || { echo "error: no such spec: $SPEC" >&2; exit 1; }
+}
+
+case "$ACTION" in
+  lock)
+    require_spec
+    mkdir -p "$(dirname "$ATT_FILE")"
+    if [ -f "$ATT_FILE" ]; then
+      awk -v s=" $SPEC " '$0 !~ s' "$ATT_FILE" > "$ATT_FILE.tmp" && mv "$ATT_FILE.tmp" "$ATT_FILE"
+    fi
+    sha=$(sha_of "$SPEC")
+    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    echo "$sha $SPEC $ts" >> "$ATT_FILE"
+    echo "locked $sha $SPEC"
+    ;;
+  verify)
+    require_spec
+    [ -f "$ATT_FILE" ] || { echo "error: no attestation file: $ATT_FILE" >&2; exit 1; }
+    want=$(awk -v s=" $SPEC " '$0 ~ s {print $1}' "$ATT_FILE" | tail -1)
+    [ -n "$want" ] || { echo "error: no lock for: $SPEC" >&2; exit 1; }
+    got=$(sha_of "$SPEC")
+    if [ "$want" = "$got" ]; then
+      echo "OK $SPEC"
+    else
+      echo "TAMPER $SPEC" >&2
+      echo "  expected: $want" >&2
+      echo "  got     : $got" >&2
+      echo "  → run 'qspec-attest clear $SPEC' to acknowledge and re-lock" >&2
+      exit 2
+    fi
+    ;;
+  clear)
+    require_spec
+    [ -f "$ATT_FILE" ] || { echo "no attestation file (nothing to clear)"; exit 0; }
+    awk -v s=" $SPEC " '$0 !~ s' "$ATT_FILE" > "$ATT_FILE.tmp" && mv "$ATT_FILE.tmp" "$ATT_FILE"
+    echo "cleared $SPEC"
+    ;;
+  list)
+    [ -f "$ATT_FILE" ] || { echo "no attestation file: $ATT_FILE"; exit 0; }
+    cat "$ATT_FILE"
+    ;;
+  ""|-h|--help|help)
+    usage
+    ;;
+  *)
+    echo "unknown action: $ACTION" >&2
+    usage >&2
+    exit 1
+    ;;
+esac

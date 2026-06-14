@@ -4,13 +4,13 @@
 
 > A minimal coding agent that uses a frontier model as the **brain** and a local model as the **hands**.
 > Claude writes the spec → the local model does the work → Claude reviews.
-> One **~420-line single-file Python script, zero third-party dependencies**.
+> One **~550-line single-file Python script, zero third-party dependencies**.
 
 ---
 
 ## What is this
 
-Qwen-Agent is a **local coding agent**: it talks to any OpenAI-compatible local inference backend (the author runs Qwen3.6-35B-A3B on Apple Silicon via [oMLX](https://github.com/jundot/omlx)) and completes coding tasks end-to-end with 6 file tools — it explores, locates, edits, and verifies on its own.
+Qwen-Agent is a **local coding agent**: it talks to any OpenAI-compatible local inference backend (the author runs Qwen3.6-35B-A3B on Apple Silicon via [oMLX](https://github.com/jundot/omlx)) and completes coding tasks end-to-end with 6 base tools (+ 2 codegraph smart-locating tools, auto-enabled when the project has an index) — it explores, locates, edits, and verifies on its own.
 
 Its positioning is unusual: **it doesn't try to be smart.** It assumes the local model behind it is "nimble-handed but mediocre at judgment," so it leaves the **judgment** to whatever sits upstream (you, or your Claude), and focuses only on **executing mechanically, safely, and verifiably**.
 
@@ -41,14 +41,19 @@ A frontier model's (Claude's) tokens are expensive. Having it **edit code direct
 
 Qwen-Agent saves tokens on **execution**. But before Claude writes a spec or reviews, it must **understand the code** (locate symbols, trace calls) — and doing that with grep + reading a pile of files also burns tokens. **codegraph** (a code-index MCP for Claude Code) saves the understanding side too: a prebuilt index with sub-millisecond queries that returns precise `file:line` + source, so you locate code without reading whole files.
 
-| Wing | What it saves |
-|---|---|
-| **codegraph (input side)** | Claude's "read / understand" tokens — index queries instead of reading whole files |
-| **Qwen-Agent (output side)** | Claude's "write / execute" tokens — a local model instead of hand-typing |
+**As of v2, codegraph is promoted from "brain-side MCP recommendation" to built-in support inside Qwen-Agent.** When a project has a `.codegraph/codegraph.db` index, Qwen-Agent auto-detects it and enables two additional tools:
+
+- **`search_symbol`** — find symbols (class/method/function/field) by name. Much more precise than grep.
+- **`find_references`** — find callers/callees of a symbol, understand dependencies.
+
+Both query SQLite directly — zero extra dependencies, sub-ms queries. Projects without a codegraph index transparently fall back to grep with no configuration needed.
+
+| Wing | What it saves | codegraph role |
+|---|---|---|
+| **Brain side (Claude)** | "read / understand" tokens — index queries instead of reading whole files | Claude Code MCP (unchanged) |
+| **Hands side (Qwen-Agent)** | "write / execute" tokens — a local model instead of hand-typing | **v2: built-in `search_symbol` + `find_references`** |
 
 Claude is left with only the high-leverage judgment in the middle. Two quality bonuses: **more accurate spec anchors** (based on real `file:line`, not grep-from-memory) and **no lines silently eaten by shell-output compression** (avoids "a key line dropped → wrong root cause").
-
-> codegraph is a **brain-side** tool (a Claude Code MCP) — a recommended companion to this methodology, not part of the Qwen-Agent script itself.
 
 ### Second pillar — quality from the harness, not the model
 
@@ -87,12 +92,13 @@ A mid-size local model isn't smart enough; left unsupervised it makes a mess. So
 
 - 💰 **Saves cc tokens (the core)** — Claude spends tokens only on thinking (spec + diff review); reading/writing/retrying is offloaded to a free local model, off cc's bill.
 - 🧠 **Brain/hands split** — judgment stays upstream; the local model only does mechanical execution.
-- 📦 **Zero-dependency single file** — ~420 lines of pure Python stdlib (`urllib`/`argparse`/`json`/`subprocess`). No LangChain, no pip install — `chmod +x` and go.
+- 📦 **Zero-dependency single file** — ~550 lines of pure Python stdlib (`urllib`/`argparse`/`json`/`subprocess`). No LangChain, no pip install — `chmod +x` and go.
 - 🔌 **Any OpenAI-compatible backend** — oMLX / LM Studio / `mlx_lm.server` / llama.cpp server / vLLM; swap with `--model`.
 - 🔒 **Write allowlist** (`--allow`) — out-of-scope `edit`/`write` is physically refused.
 - 📏 **Diff-size tripwire** (`--max-diff-lines`) — catches "over-editing inside an allowed file."
 - ✅ **Auto-verify + self-correction** (`--verify`) — on failure, feed the error back to the model to fix itself, Aider-style, up to N times.
 - 🩹 **ACI self-correction** — failed `edit` returns the closest existing content for a byte-accurate retry; nudge on empty turns; `stuck` after 14 turns without action; tool-call leak detection.
+- 🔍 **codegraph smart locating** (auto-enabled) — when the project has a `.codegraph/` index, `search_symbol` + `find_references` are injected automatically; more precise than grep. Falls back transparently without an index.
 - 🚪 **Scriptable** — preflight health check + clear exit codes (`0`/`1`/`3`).
 - 🛡️ **Path sandbox** — all file ops are confined to the `--project` root; `../` escapes are blocked.
 
@@ -117,6 +123,22 @@ chmod +x /usr/local/bin/Qwen-Agent
 
 ```bash
 curl -s http://127.0.0.1:18888/v1/models | jq '.data[].id'
+```
+
+### Companion tool: qspec-attest (optional)
+
+`qspec-attest` is a SHA-256 lock for spec files, ensuring specs aren't silently tampered with after dispatch:
+
+```bash
+curl -o /usr/local/bin/qspec-attest https://raw.githubusercontent.com/Song-ic/Qwen-Agent/main/qspec-attest
+chmod +x /usr/local/bin/qspec-attest
+```
+
+Usage:
+```bash
+qspec-attest lock spec.md     # Lock the spec's SHA
+qspec-attest verify spec.md   # Verify it hasn't been tampered with
+qspec-attest clear spec.md    # Unlock (before editing the spec)
 ```
 
 ---
@@ -160,7 +182,7 @@ Qwen-Agent --project . --task "..." \
 | `--task-file` | — | Read the spec from a file |
 | *(stdin)* | — | Spec can also be piped in |
 | `--base` | `http://127.0.0.1:18888/v1` | OpenAI-compatible backend URL |
-| `--model` | `Qwen3.6-35B-A3B-…-oQ4-MTP` | Model ID (match what your backend loaded) |
+| `--model` | `Qwen3.6-35B-A3B-oQ6-fp16-mtp` | Model ID (match what your backend loaded) |
 | `--allow` | unrestricted | **Write allowlist**: comma-separated relative paths/globs; only these may be `edit`/`write`, the rest are refused |
 | `--max-diff-lines` | off | After the run, check total `git diff` lines and **warn** above the threshold (logic-overreach tripwire) |
 | `--verify` | none | Verification command run after `status=done` (compile/test/grep assertion) |
@@ -268,6 +290,7 @@ The most counterintuitive — and most valuable — idea here: **don't bet on th
 - Requires a backend model with **function calling**; pure completion models won't work.
 - Large single changes tend to early-stop; upstream must **split into smaller pieces**.
 - `run_bash` has a 60s timeout and 3000-char output cap; `grep` results are capped at 60 lines — deliberately limited to save context.
+- codegraph tools require the project to have a `.codegraph/codegraph.db` index (maintained by the codegraph MCP server's file watcher); without an index, the agent transparently falls back to grep.
 - No persisted multi-turn memory: one task per dispatch; state isn't kept across processes (recoverability is left to the upstream orchestrator).
 
 ---

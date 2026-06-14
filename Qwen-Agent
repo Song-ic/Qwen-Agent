@@ -24,9 +24,10 @@ import urllib.error
 import urllib.request
 
 DEFAULT_BASE = "http://127.0.0.1:18888/v1"  # oMLX
-DEFAULT_MODEL = "Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-MLX-oQ4-MTP"  # oQ4:18GB/最快/并发余量大。实测 Q4/Q6/Q8 在 judgment 任务全翻且程度相当(金额都过度套用到 9);既都要 review,就按内存+速度选 Q4(2026-06-07)。oQ8 会 OOM 勿用;质量靠 harness(规格+机器判据+高风险 review)不靠模型
+DEFAULT_MODEL = "Qwen3.6-35B-A3B-oQ6-fp16-mtp"  # oQ6:28GB/MTP 生效(原生 head,非蒸馏)/Burst Decode Aggressive 下 ~113 tok/s(引擎层)。Q4 蒸馏版 MTP 负优化已弃;质量靠 harness 不靠模型(2026-06-14)
 ROOT = os.getcwd()  # overwritten in main()
 ALLOW = None  # 写白名单(防越界):None=不限制;list=只允许 edit/write 这些相对路径/glob,其余拒绝
+CODEGRAPH_DB = None  # .codegraph/codegraph.db 绝对路径;None=项目无 codegraph
 
 SYSTEM_PROMPT = """You are a precise, autonomous coding agent working inside a real software project.
 You complete coding tasks end-to-end: explore the code, reason about the change, apply edits with tools, and verify the result.
@@ -64,7 +65,7 @@ Think briefly before each tool call: what you know, what's still needed, the nex
 - Use `python3` (not `python`) to run code/tests; `python` and `pytest` may not be on PATH. Prefer `python3 -m unittest` or `python3 -m pytest`.
 """
 
-TOOLS = [
+TOOLS_BASE = [
     {"type": "function", "function": {
         "name": "list_dir",
         "description": "List files and directories at a relative path within the project. Use '.' for the project root.",
@@ -94,6 +95,25 @@ TOOLS = [
         "description": "Run a shell command from the project root and return combined stdout/stderr.",
         "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
 ]
+
+TOOLS_CODEGRAPH = [
+    {"type": "function", "function": {
+        "name": "search_symbol",
+        "description": "Search for code symbols (class, method, function, field, etc.) by name in the project's code index. Much faster and more precise than grep for locating definitions. Returns: name, kind, file_path, start_line, signature.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Symbol name or partial name to search (case-insensitive)."},
+            "kind": {"type": "string", "description": "Optional filter: class, method, function, field, interface, enum, component, route, etc."}},
+            "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "find_references",
+        "description": "Find what calls/uses a symbol, or what a symbol calls/uses. Use to understand dependencies before making changes.",
+        "parameters": {"type": "object", "properties": {
+            "symbol": {"type": "string", "description": "Exact symbol name to look up."},
+            "direction": {"type": "string", "enum": ["callers", "callees", "both"], "description": "callers = who calls this symbol; callees = what this symbol calls; both = both directions. Default: callers."}},
+            "required": ["symbol"]}}},
+]
+
+TOOLS = list(TOOLS_BASE)  # mutable; codegraph tools appended in main() if .codegraph/ exists
 
 
 def _safe(path: str) -> str:
@@ -133,6 +153,92 @@ def _edit_hint(text: str, old: str) -> str:
         blocks.append("\n".join(f"{n+1}: {file_lines[n]}" for n in range(lo, hi)))
     return (" 最接近的现有内容(带行号,照它逐字重写 old_string):\n"
             + "\n  ---\n".join(blocks))
+
+
+import sqlite3 as _sqlite3
+
+
+def _codegraph_search(query: str, kind: str = None) -> str:
+    """search_symbol: 按名字查符号,返回 name/kind/file:line/signature。"""
+    if not CODEGRAPH_DB or not os.path.isfile(CODEGRAPH_DB):
+        return "ERROR: codegraph not available for this project."
+    if not query:
+        return "ERROR: query is required."
+    try:
+        conn = _sqlite3.connect(CODEGRAPH_DB)
+        conn.row_factory = _sqlite3.Row
+        sql = ("SELECT name, kind, file_path, start_line, end_line, signature "
+               "FROM nodes WHERE lower(name) LIKE ? ")
+        params = [f"%{query.lower()}%"]
+        if kind:
+            sql += "AND kind = ? "
+            params.append(kind)
+        sql += "ORDER BY CASE WHEN lower(name) = ? THEN 0 ELSE 1 END, name LIMIT 30"
+        params.append(query.lower())
+        rows = conn.execute(sql, params).fetchall()
+        conn.close()
+        if not rows:
+            return f"(no symbols matching '{query}')"
+        lines = []
+        for r in rows:
+            sig = f"  {r['signature']}" if r["signature"] else ""
+            lines.append(f"{r['kind']:12s} {r['name']:40s} {r['file_path']}:{r['start_line']}-{r['end_line']}{sig}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"ERROR: codegraph query failed: {e}"
+
+
+def _codegraph_refs(symbol: str, direction: str = "callers") -> str:
+    """find_references: 查谁调用/引用某符号,或某符号调用了谁。"""
+    if not CODEGRAPH_DB or not os.path.isfile(CODEGRAPH_DB):
+        return "ERROR: codegraph not available for this project."
+    if not symbol:
+        return "ERROR: symbol is required."
+    try:
+        conn = _sqlite3.connect(CODEGRAPH_DB)
+        conn.row_factory = _sqlite3.Row
+        node_rows = conn.execute(
+            "SELECT id, name, kind, file_path, start_line FROM nodes WHERE lower(name) = ?",
+            [symbol.lower()]).fetchall()
+        if not node_rows:
+            node_rows = conn.execute(
+                "SELECT id, name, kind, file_path, start_line FROM nodes WHERE lower(name) LIKE ?",
+                [f"%{symbol.lower()}%"]).fetchall()
+        if not node_rows:
+            conn.close()
+            return f"(no symbol '{symbol}' found in codegraph)"
+        lines = []
+        for node in node_rows[:5]:
+            nid = node["id"]
+            lines.append(f"── {node['kind']} {node['name']} @ {node['file_path']}:{node['start_line']}")
+            if direction in ("callers", "both"):
+                callers = conn.execute(
+                    "SELECT n.name, n.kind, n.file_path, n.start_line, e.kind AS edge_kind "
+                    "FROM edges e JOIN nodes n ON e.source = n.id "
+                    "WHERE e.target = ? ORDER BY n.file_path, n.start_line LIMIT 20",
+                    [nid]).fetchall()
+                if callers:
+                    lines.append("  callers:")
+                    for c in callers:
+                        lines.append(f"    [{c['edge_kind']}] {c['kind']} {c['name']} @ {c['file_path']}:{c['start_line']}")
+                else:
+                    lines.append("  callers: (none)")
+            if direction in ("callees", "both"):
+                callees = conn.execute(
+                    "SELECT n.name, n.kind, n.file_path, n.start_line, e.kind AS edge_kind "
+                    "FROM edges e JOIN nodes n ON e.target = n.id "
+                    "WHERE e.source = ? ORDER BY n.file_path, n.start_line LIMIT 20",
+                    [nid]).fetchall()
+                if callees:
+                    lines.append("  callees:")
+                    for c in callees:
+                        lines.append(f"    [{c['edge_kind']}] {c['kind']} {c['name']} @ {c['file_path']}:{c['start_line']}")
+                else:
+                    lines.append("  callees: (none)")
+        conn.close()
+        return "\n".join(lines)
+    except Exception as e:
+        return f"ERROR: codegraph query failed: {e}"
 
 
 def exec_tool(name: str, args: dict) -> str:
@@ -197,8 +303,14 @@ def exec_tool(name: str, args: dict) -> str:
                                capture_output=True, text=True, timeout=60)
             out = (r.stdout + r.stderr).strip()
             return out[:3000] if out else f"(exit {r.returncode}, no output)"
+        if name == "search_symbol":
+            return _codegraph_search(args.get("query", ""), args.get("kind"))
+        if name == "find_references":
+            return _codegraph_refs(args.get("symbol", ""), args.get("direction", "callers"))
         return (f"ERROR: unknown tool '{name}'. Available tools: "
-                "list_dir, read_file, grep, edit_file, write_file, run_bash.")
+                "list_dir, read_file, grep, edit_file, write_file, run_bash"
+                + (", search_symbol, find_references" if CODEGRAPH_DB else "")
+                + ".")
     except KeyError as e:
         return f"ERROR: missing argument {e}"
     except Exception as e:  # noqa: BLE001
@@ -218,9 +330,20 @@ def chat(messages, base, model, temperature, reasoning_effort, timeout, max_toke
         return json.loads(resp.read())
 
 
+CODEGRAPH_PROMPT_EXTRA = """
+# Code Index (codegraph)
+This project has a code index. You have two extra tools:
+- search_symbol(query, kind?): search for symbols (class/method/function/field/etc.) by name. MUCH faster and more precise than grep for finding definitions. Use this FIRST when locating where something is defined.
+- find_references(symbol, direction?): find callers/callees of a symbol. direction: "callers" (default), "callees", or "both".
+
+PREFER search_symbol over grep when looking for a specific class, method, or function definition. Use grep only for string literals, config values, or patterns that aren't symbol names.
+"""
+
+
 def run_agent(task, base, model, temperature, reasoning_effort,
               max_nudge, max_turns, timeout, max_tokens, verbose):
-    messages = [{"role": "system", "content": SYSTEM_PROMPT},
+    sys_prompt = SYSTEM_PROMPT + (CODEGRAPH_PROMPT_EXTRA if CODEGRAPH_DB else "")
+    messages = [{"role": "system", "content": sys_prompt},
                 {"role": "user", "content": task}]
     nudges = 0
     no_progress = 0  # 连续无 edit/write 的轮数(anti-storm:防 grep/read 风暴空转到 max_turns)
@@ -333,6 +456,16 @@ def main():
     ROOT = os.path.realpath(args.project)
     if not os.path.isdir(ROOT):
         ap.error(f"project dir not found: {ROOT}")
+
+    # codegraph 检测:项目有 .codegraph/codegraph.db 时自动注入 search_symbol/find_references 工具
+    global CODEGRAPH_DB
+    cg_path = os.path.join(ROOT, ".codegraph", "codegraph.db")
+    if os.path.isfile(cg_path):
+        CODEGRAPH_DB = cg_path
+        TOOLS.extend(TOOLS_CODEGRAPH)
+        print(f"[Qwen-Agent] codegraph 检测到: {cg_path} → 启用 search_symbol/find_references")
+    else:
+        print("[Qwen-Agent] codegraph 未检测到 → 使用 grep 定位")
 
     if args.allow:
         ALLOW = [(p.strip()[2:] if p.strip().startswith("./") else p.strip())
