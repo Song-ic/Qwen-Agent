@@ -1,111 +1,100 @@
 #!/usr/bin/env python3
-"""qwen-agent-mcp — MCP stdio server wrapping Qwen-Agent CLI.
+"""MCP stdio server that runs a local coding agent directly against oMLX."""
 
-Lets Claude Code and Codex dispatch coding tasks to the local Qwen-Agent
-(Q6 via oMLX) through a standard MCP tool interface.
-
-Zero external dependencies. Single file. Same philosophy as Qwen-Agent.
-
-Install:
-  cp qwen-agent-mcp ~/.local/bin/ && chmod +x ~/.local/bin/qwen-agent-mcp
-
-Claude Code (~/.claude.json → mcpServers):
-  "qwen-agent": {"command": "qwen-agent-mcp"}
-
-Codex (config.toml → [mcp_servers.qwen-agent]):
-  command = "qwen-agent-mcp"
-
-Test:
-  echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}}' | qwen-agent-mcp
-"""
 import json
 import os
+import re
 import signal
-import subprocess
 import sys
+import time
 import urllib.request
+from datetime import datetime, timezone
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-QWEN_AGENT_BIN = os.path.expanduser("~/.local/bin/Qwen-Agent")
-DEFAULT_BASE = "http://127.0.0.1:18888/v1"
-DISPATCH_TIMEOUT = 600  # 10 min
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import si_qwen_core as core
 
-# ---------------------------------------------------------------------------
-# Server instructions — injected into client system prompt (Claude & Codex)
-# ---------------------------------------------------------------------------
+
+LOCKFILE = "/tmp/si-qwen-agent.lock"
+
 INSTRUCTIONS = """\
-# Qwen-Agent — Local Coding Agent
+# si-qwen — Local Coding Agent (Brain/Hand Protocol)
 
-You have access to a **local coding agent** (Qwen-Agent) running a free local LLM \
-(Qwen 3.6 35B via oMLX on Apple Silicon, ~113 tok/s). \
-Use it to offload mechanical coding tasks — saves API tokens, results stay local.
+You = Brain (specify and independently verify). si-qwen MCP = Hand. The MCP server now
+manages the coding-agent loop in-process and calls oMLX directly; it does not launch the
+legacy `Qwen-Agent` executable.
 
-## Three-tier dispatch routing
+## Three-tier dispatch
 
-### Tier 1 — You do it directly (DON'T call Qwen-Agent)
-- Trivial: single value, typo, constant — describing it is longer than doing it.
+### Tier 1 — Brain does directly
+Single value / typo / constant where dispatch overhead is larger than the edit. State
+"绕过 si-qwen(原因:xxx)" explicitly.
 
-### Tier 2 — dispatch_task (one-liner, no spec file)
-ALL must be true: root cause clear, single file, <30 lines, not high-risk, \
-no precise value constraints.
+### Tier 2 — dispatch_task
+Use only when all are true: root cause is clear, single file, under 30 changed lines,
+not high-risk, and no precise-value ambiguity.
 
-### Tier 3 — dispatch_spec (spec file → dispatch)
-ANY triggers it: multi-file, needs judgment, precise values, high-risk, \
->30 lines, new feature, or previous dispatch_task failed.
+### Tier 3 — dispatch_spec
+Use for multi-file work, judgment/disambiguation, precise values, high-risk changes,
+new features, over 30 lines, or a failed Tier 2 attempt.
+
+## Guardrails
+- `allow`: editable paths/globs. Required for judgment and multi-file work.
+- `verify`: machine-verifiable post-change command.
+- `max_diff_lines`: warning threshold for over-editing.
+- After dispatch, independently inspect git diff and run the relevant verification.
+
+## Context and streaming behavior
+- Tool output is length-bounded.
+- Unchanged file snapshots are referenced instead of duplicated.
+- Context is compacted around 28k estimated tokens toward 24k.
+- Compaction preserves the original task, successful-change summary, and recent rounds.
+- Model output and tool status stream through MCP `notifications/progress` when the client
+  supplies a progress token.
 
 ## Protocol
-1. Call **check_backend()** first to verify the local LLM is online.
-2. Tier 2: call **dispatch_task** with a clear one-liner.
-3. Tier 3: write a spec .md file, then call **dispatch_spec**.
-4. After dispatch: **NEVER trust self-report**. Verify independently \
-(git diff / compile / test / grep).
-5. Failure: fix spec and retry, or fall back to Tier 1.
+1. Call `check_backend` before dispatch.
+2. Dispatch with a clear spec and guardrails.
+3. Never trust self-report; verify independently.
+4. Before retrying a failed spec, call `task_history`.
+5. progress.log is written automatically for dispatch_spec.
 
-## Key parameters
-- **allow**: comma-separated paths/globs — restricts editable files (prevents scope creep).
-- **verify**: shell command run post-completion — exit 0 = pass, else auto-retry.
-- **max_diff_lines**: warn if changed lines exceed threshold (catches over-editing).
+## Spec quality (Brain must follow when writing specs)
+- For bulk literal find-and-replace across many files, structure the spec as a replacement table (file, find, replace) — the agent has a `batch_replace` tool that applies all replacements in one call without needing to read files first.
+- Name exact files and functions to modify. Never say "find and fix all X".
+- Include negative constraints: "do NOT modify [adjacent file/function]".
+- Bug fix specs: include reproduction command + expected vs actual behavior.
+- Feature specs: include the verification command (compile/test/curl).
 """
 
-# ---------------------------------------------------------------------------
-# Tool definitions
-# ---------------------------------------------------------------------------
 TOOLS = [
     {
         "name": "dispatch_task",
         "description": (
-            "Dispatch a coding task to the local Qwen-Agent as a one-liner. "
-            "For Tier 2: clear target, single file, <30 lines, non-high-risk. "
-            "Returns status (done/stuck/early_stop/max_turns) and exit code "
-            "(0=success, 1=fail, 3=backend down)."
+            "Run a Tier 2 coding task through the in-process si-qwen agent, which calls "
+            "oMLX directly. Streams model/tool progress when supported by the client."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "project": {
                     "type": "string",
-                    "description": "Absolute path to the project root directory.",
+                    "description": "Absolute project root.",
                 },
                 "task": {
                     "type": "string",
-                    "description": (
-                        "Task description. Include: what to change, where "
-                        "(file/method/class anchor), and key constraints."
-                    ),
+                    "description": "Clear task, location anchor, and constraints.",
                 },
                 "allow": {
                     "type": "string",
-                    "description": "Comma-separated relative paths/globs of editable files. Omit = no restriction.",
+                    "description": "Comma-separated editable relative paths/globs.",
                 },
                 "verify": {
                     "type": "string",
-                    "description": "Verification command (e.g. 'mvn -q compile'). Exit 0 = pass.",
+                    "description": "Verification shell command. Exit 0 passes.",
                 },
                 "max_diff_lines": {
                     "type": "integer",
-                    "description": "Warn if total diff lines exceed this.",
+                    "description": "Warn when the total diff exceeds this many lines.",
                 },
             },
             "required": ["project", "task"],
@@ -114,36 +103,35 @@ TOOLS = [
     {
         "name": "dispatch_spec",
         "description": (
-            "Dispatch a coding task from a spec file to the local Qwen-Agent. "
-            "For Tier 3: multi-file, judgment, precise values, high-risk, or >30 lines. "
-            "Write the spec .md file first, then call this tool."
+            "Run a Tier 3 task from a spec file through the in-process si-qwen agent, "
+            "which calls oMLX directly."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "project": {
                     "type": "string",
-                    "description": "Absolute path to the project root directory.",
+                    "description": "Absolute project root.",
                 },
                 "spec_file": {
                     "type": "string",
-                    "description": "Spec file path (absolute, or relative to project root).",
+                    "description": "Absolute path or path relative to the project root.",
                 },
                 "allow": {
                     "type": "string",
-                    "description": "Comma-separated relative paths/globs of editable files.",
+                    "description": "Comma-separated editable relative paths/globs.",
                 },
                 "verify": {
                     "type": "string",
-                    "description": "Verification command. Exit 0 = pass.",
+                    "description": "Verification shell command. Exit 0 passes.",
                 },
                 "max_diff_lines": {
                     "type": "integer",
-                    "description": "Warn if total diff lines exceed this.",
+                    "description": "Warn when the total diff exceeds this many lines.",
                 },
                 "verify_retries": {
                     "type": "integer",
-                    "description": "Auto-fix retries on verify fail (default 2; 0 = verify only).",
+                    "description": "Automatic fix retries after verification failure.",
                 },
             },
             "required": ["project", "spec_file"],
@@ -151,115 +139,209 @@ TOOLS = [
     },
     {
         "name": "check_backend",
-        "description": (
-            "Check if the local LLM backend (oMLX) is online and which model is loaded. "
-            "Call before dispatching."
-        ),
+        "description": "Check oMLX connectivity and list available models.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "base_url": {
                     "type": "string",
-                    "description": f"oMLX base URL (default: {DEFAULT_BASE}).",
+                    "description": f"oMLX API base. Default: {core.DEFAULT_BASE}",
                 },
             },
         },
     },
+    {
+        "name": "task_history",
+        "description": "Read .qwen-tasks progress logs before retrying a failed spec.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "Absolute project root.",
+                },
+                "spec": {
+                    "type": "string",
+                    "description": "Optional progress-log filename prefix.",
+                },
+            },
+            "required": ["project"],
+        },
+    },
 ]
 
-# ---------------------------------------------------------------------------
-# Tool implementations
-# ---------------------------------------------------------------------------
 
 def _ok(text):
     return {"content": [{"type": "text", "text": text}], "isError": False}
 
+
 def _err(text):
     return {"content": [{"type": "text", "text": text}], "isError": True}
 
-def _log(msg):
-    print(f"[qwen-agent-mcp] {msg}", file=sys.stderr, flush=True)
 
-def _run_agent(cmd):
-    _log(f"exec: {' '.join(cmd[:6])}...")
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=DISPATCH_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        return _err(f"Qwen-Agent timed out ({DISPATCH_TIMEOUT}s)")
-    except FileNotFoundError:
-        return _err(f"Qwen-Agent binary not found: {QWEN_AGENT_BIN}")
-    except Exception as e:
-        return _err(f"Execution error: {type(e).__name__}: {e}")
-
-    out = proc.stdout
-    if len(out) > 4000:
-        out = f"...(truncated {len(proc.stdout) - 4000} chars)...\n" + out[-4000:]
-    text = f"exit_code: {proc.returncode}\n\n{out}"
-    if proc.stderr:
-        text += f"\nstderr (last 500):\n{proc.stderr[-500:]}"
-    return {"content": [{"type": "text", "text": text}], "isError": proc.returncode != 0}
+def _log(message):
+    print(f"[si-qwen-mcp] {message}", file=sys.stderr, flush=True)
 
 
-def do_dispatch_task(args):
-    project = args.get("project", "")
-    task = args.get("task", "")
+def _parse_agent_output(text):
+    info = {}
+    match = re.search(r"status=(\w+)\s+turns=(\d+)", text)
+    if match:
+        info["status"] = match.group(1)
+        info["turns"] = int(match.group(2))
+    match = re.search(r"exit_code:\s*(\d+)", text)
+    if match:
+        info["exit_code"] = int(match.group(1))
+    if "验证 PASS" in text:
+        info["verify"] = "PASS"
+    elif "验证 FAIL" in text or "verify_failed" in text:
+        info["verify"] = "FAIL"
+    match = re.search(r"diff 规模\s+(\d+)\s+行", text)
+    if match:
+        info["diff_lines"] = int(match.group(1))
+    if "⚠ DIFF" in text:
+        info["tripwire"] = True
+    return info
+
+
+def _auto_log_progress(project, spec_file, result_text):
+    stem = os.path.splitext(os.path.basename(spec_file))[0]
+    tasks_dir = os.path.join(os.path.realpath(project), ".qwen-tasks")
+    log_path = os.path.join(tasks_dir, f"{stem}.progress.log")
+    info = _parse_agent_output(result_text)
+    attempt = 1
+    if os.path.isfile(log_path):
+        with open(log_path, encoding="utf-8") as handle:
+            attempt = sum(1 for line in handle if "attempt" in line) + 1
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    turns = info.get("turns", "?")
+    diff = info.get("diff_lines", "?")
+    status = info.get("status", "unknown")
+    passed = info.get("verify") == "PASS" or (
+        info.get("verify") is None and info.get("exit_code", 1) == 0
+    )
+    reasons = []
+    if status in ("stuck", "early_stop", "max_turns", "verify_failed", "exception"):
+        reasons.append(status)
+    if info.get("tripwire"):
+        reasons.append(f"diff {diff} over threshold")
+    if info.get("verify") == "FAIL":
+        reasons.append("verify failed")
+    if not reasons:
+        reasons.append(status)
+    entry = (
+        f"{timestamp} · attempt {attempt} · turns={turns} · diff={diff} · "
+        f"{'PASS' if passed else 'FAIL'}: {'; '.join(reasons)}"
+    )
+    os.makedirs(tasks_dir, exist_ok=True)
+    with open(log_path, "a", encoding="utf-8") as handle:
+        handle.write(entry + "\n")
+    _log(f"progress logged: {log_path}")
+    return entry
+
+
+def _run_dispatch(arguments, task, progress):
+    project = arguments.get("project", "")
     if not project or not os.path.isdir(project):
         return _err(f"Project directory not found: {project}")
     if not task.strip():
         return _err("Task description is empty.")
 
-    cmd = [QWEN_AGENT_BIN, "--project", project, "--task", task]
-    if args.get("allow"):
-        cmd += ["--allow", args["allow"]]
-    if args.get("verify"):
-        cmd += ["--verify", args["verify"]]
-    if args.get("max_diff_lines") is not None:
-        cmd += ["--max-diff-lines", str(args["max_diff_lines"])]
-    return _run_agent(cmd)
+    try:
+        lock_token = core.acquire_process_lock(
+            LOCKFILE,
+            wait_timeout=600,
+            progress=progress,
+        )
+    except TimeoutError as error:
+        return _err(str(error))
+    try:
+        result = core.run_dispatch(
+            project=os.path.realpath(project),
+            task=task,
+            allow=arguments.get("allow"),
+            verify=arguments.get("verify"),
+            max_diff_lines=arguments.get("max_diff_lines"),
+            verify_retries=arguments.get("verify_retries", 2),
+            progress=progress,
+        )
+    except Exception as error:
+        return _err(f"Dispatch error: {type(error).__name__}: {error}")
+    finally:
+        core.release_process_lock(lock_token)
+
+    text = core.format_dispatch_result(result)
+    return {
+        "content": [{"type": "text", "text": text}],
+        "isError": result.get("status") != "done",
+    }
 
 
-def do_dispatch_spec(args):
-    project = args.get("project", "")
-    spec = args.get("spec_file", "")
+def do_dispatch_task(arguments, progress=None):
+    return _run_dispatch(arguments, arguments.get("task", ""), progress or (lambda _text: None))
+
+
+def do_dispatch_spec(arguments, progress=None):
+    project = arguments.get("project", "")
+    spec_file = arguments.get("spec_file", "")
+    if not os.path.isabs(spec_file):
+        spec_file = os.path.join(project, spec_file)
+    if not os.path.isfile(spec_file):
+        return _err(f"Spec file not found: {spec_file}")
+    with open(spec_file, encoding="utf-8") as handle:
+        task = handle.read()
+    result = _run_dispatch(arguments, task, progress or (lambda _text: None))
+    try:
+        text = result["content"][0]["text"]
+        entry = _auto_log_progress(project, spec_file, text)
+        result["content"][0]["text"] += f"\n\nprogress.log: {entry}"
+    except Exception as error:
+        _log(f"auto-log failed: {error}")
+    return result
+
+
+def do_check_backend(arguments, progress=None):
+    del progress
+    base = arguments.get("base_url") or core.DEFAULT_BASE
+    try:
+        models = core.check_backend(base)
+        return _ok(f"Backend online: {base}\nModels: {', '.join(models)}")
+    except Exception as error:
+        return _err(f"Backend NOT reachable ({base}): {error}")
+
+
+def do_task_history(arguments, progress=None):
+    del progress
+    project = arguments.get("project", "")
     if not project or not os.path.isdir(project):
         return _err(f"Project directory not found: {project}")
-    if not os.path.isabs(spec):
-        spec = os.path.join(project, spec)
-    if not os.path.isfile(spec):
-        return _err(f"Spec file not found: {spec}")
+    spec_filter = arguments.get("spec")
+    tasks_dir = os.path.join(os.path.realpath(project), ".qwen-tasks")
+    if not os.path.isdir(tasks_dir):
+        return _ok("No .qwen-tasks/ directory. No dispatch history yet.")
 
-    cmd = [QWEN_AGENT_BIN, "--project", project, "--task-file", spec]
-    if args.get("allow"):
-        cmd += ["--allow", args["allow"]]
-    if args.get("verify"):
-        cmd += ["--verify", args["verify"]]
-    if args.get("max_diff_lines") is not None:
-        cmd += ["--max-diff-lines", str(args["max_diff_lines"])]
-    if args.get("verify_retries") is not None:
-        cmd += ["--verify-retries", str(args["verify_retries"])]
-    return _run_agent(cmd)
-
-
-def do_check_backend(args):
-    base = args.get("base_url") or DEFAULT_BASE
-    try:
-        req = urllib.request.Request(f"{base}/models", method="GET")
-        with urllib.request.urlopen(req, timeout=10) as r:
-            models = [m.get("id", "?") for m in json.loads(r.read()).get("data", [])]
-        return _ok(f"Backend online: {base}\nModels: {', '.join(models)}")
-    except Exception as e:
-        return _err(f"Backend NOT reachable ({base}): {e}")
+    logs = []
+    for filename in sorted(os.listdir(tasks_dir)):
+        if not filename.endswith(".progress.log"):
+            continue
+        if spec_filter and not filename.startswith(spec_filter):
+            continue
+        path = os.path.join(tasks_dir, filename)
+        with open(path, encoding="utf-8") as handle:
+            content = handle.read().strip()
+        if content:
+            logs.append(f"=== {filename} ===\n{content}")
+    return _ok("\n\n".join(logs) if logs else "No progress logs found.")
 
 
 TOOL_DISPATCH = {
     "dispatch_task": do_dispatch_task,
     "dispatch_spec": do_dispatch_spec,
     "check_backend": do_check_backend,
+    "task_history": do_task_history,
 }
 
-# ---------------------------------------------------------------------------
-# MCP stdio transport (auto-detect Content-Length / newline framing)
-# ---------------------------------------------------------------------------
 _stdin = sys.stdin.buffer
 _stdout = sys.stdout.buffer
 
@@ -271,9 +353,8 @@ def _read_message():
     line = line.strip()
     if not line:
         return _read_message()
-
     if line.startswith(b"Content-Length:"):
-        length = int(line.split(b":")[1].strip())
+        length = int(line.split(b":", 1)[1].strip())
         while _stdin.readline().strip():
             pass
         data = b""
@@ -286,70 +367,107 @@ def _read_message():
     return json.loads(line)
 
 
-def _write_message(msg):
-    data = json.dumps(msg, ensure_ascii=False).encode("utf-8")
-    _stdout.write(f"Content-Length: {len(data)}\r\n\r\n".encode("utf-8"))
-    _stdout.write(data)
+def _write_message(message):
+    data = json.dumps(message, ensure_ascii=False).encode("utf-8")
+    _stdout.write(data + b"\n")
     _stdout.flush()
 
 
-# ---------------------------------------------------------------------------
-# JSON-RPC handler
-# ---------------------------------------------------------------------------
+class ProgressReporter:
+    def __init__(self, token):
+        self.token = token
+        self.sequence = 0
+        self.buffer = ""
+        self.last_sent = time.monotonic()
 
-def _handle(msg):
-    method = msg.get("method")
-    msg_id = msg.get("id")
+    def __call__(self, text):
+        if self.token is None:
+            return
+        self.buffer += str(text)
+        now = time.monotonic()
+        status = str(text).startswith(
+            (
+                "turn ",
+                "tool:",
+                "verification",
+                "context compacted",
+                "early stop",
+                "waiting for oMLX",
+            )
+        )
+        if len(self.buffer) >= 160 or status or now - self.last_sent >= 0.25:
+            self.flush()
 
-    if msg_id is None:
+    def flush(self):
+        if self.token is None or not self.buffer:
+            return
+        self.sequence += 1
+        _write_message({
+            "jsonrpc": "2.0",
+            "method": "notifications/progress",
+            "params": {
+                "progressToken": self.token,
+                "progress": self.sequence,
+                "message": core.truncate_output(self.buffer, 1200),
+            },
+        })
+        self.buffer = ""
+        self.last_sent = time.monotonic()
+
+
+def _handle(message):
+    method = message.get("method")
+    message_id = message.get("id")
+    if message_id is None:
         return None
 
     if method == "initialize":
         result = {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "qwen-agent", "version": "1.0.0"},
+            "serverInfo": {"name": "si-qwen", "version": "2.0.0"},
             "instructions": INSTRUCTIONS,
         }
     elif method == "tools/list":
         result = {"tools": TOOLS}
     elif method == "tools/call":
-        params = msg.get("params", {})
+        params = message.get("params", {})
         name = params.get("name", "")
         arguments = params.get("arguments", {})
+        token = (params.get("_meta") or {}).get("progressToken")
+        reporter = ProgressReporter(token)
         handler = TOOL_DISPATCH.get(name)
-        if handler:
-            try:
-                result = handler(arguments)
-            except Exception as e:
-                result = _err(f"Internal error in {name}: {type(e).__name__}: {e}")
-        else:
+        if handler is None:
             result = _err(f"Unknown tool: {name}")
+        else:
+            try:
+                result = handler(arguments, progress=reporter)
+            except Exception as error:
+                result = _err(f"Internal error in {name}: {type(error).__name__}: {error}")
+            finally:
+                reporter.flush()
     elif method == "ping":
         result = {}
     else:
         return {
-            "jsonrpc": "2.0", "id": msg_id,
+            "jsonrpc": "2.0",
+            "id": message_id,
             "error": {"code": -32601, "message": f"Method not found: {method}"},
         }
-    return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+    return {"jsonrpc": "2.0", "id": message_id, "result": result}
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def main():
-    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
-    _log("started")
+    signal.signal(signal.SIGINT, lambda *_args: sys.exit(0))
+    _log("started (direct oMLX mode)")
     try:
         while True:
-            msg = _read_message()
-            if msg is None:
+            message = _read_message()
+            if message is None:
                 break
-            resp = _handle(msg)
-            if resp is not None:
-                _write_message(resp)
+            response = _handle(message)
+            if response is not None:
+                _write_message(response)
     except (BrokenPipeError, IOError):
         pass
     _log("stopped")
